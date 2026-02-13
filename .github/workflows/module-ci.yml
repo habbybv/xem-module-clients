@@ -1,0 +1,49 @@
+name: Module CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  module-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install module package
+        run: |
+          pip install -e .
+
+      - name: Validate import and manifest entrypoint
+        run: |
+          python - <<'PY'
+          from importlib.metadata import entry_points
+          eps = entry_points()
+          try:
+              group = eps.select(group="xem.modules")
+          except Exception:
+              group = eps.get("xem.modules", [])
+          names = sorted([str(ep.name) for ep in group])
+          if not names:
+              raise SystemExit("No xem.modules entrypoint found")
+          print("xem.modules:", names)
+          PY
+
+      - name: Run tests if present
+        run: |
+          if [ -d tests ]; then
+            pytest -q
+          else
+            echo "No tests directory; skipping pytest"
+          fi
