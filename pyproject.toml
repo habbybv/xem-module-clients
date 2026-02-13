@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xem-module-clients"
+version = "0.1.0"
+description = "Clients module package for XEM core"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["fastapi>=0.115,<0.116"]
+
+[project.entry-points."xem.modules"]
+clients = "xem_module_clients.manifest:get_manifest"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
