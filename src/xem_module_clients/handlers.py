@@ -5,6 +5,12 @@ from datetime import datetime
 
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+try:
+    from app.core.certification import annotate_rows_with_certification
+except Exception:  # pragma: no cover - standalone package import fallback
+    def annotate_rows_with_certification(**kwargs) -> None:
+        return None
+
 
 def build_clients_handlers(deps: dict) -> dict:
     require_any_permission = deps["require_any_permission"]
@@ -69,6 +75,72 @@ def build_clients_handlers(deps: dict) -> dict:
     build_zentriq_docx = deps["build_zentriq_docx"]
     require_user = deps["require_user"]
     timezone = deps["timezone"]
+    emit_module_autoscore_input = deps.get("emit_module_autoscore_input")
+    autoscore_ingest_self_check = deps.get("autoscore_ingest_self_check")
+
+    def _emit_clients_autoscore(
+        *,
+        client_id: int,
+        user_id: int,
+        source_ref: str,
+        domain_scores: dict[str, float],
+        confidence_index: float,
+        hard_triggers: list[dict] | None = None,
+    ) -> None:
+        if not emit_module_autoscore_input:
+            return
+        payload = {
+            "module_id": "clients",
+            "source_ref": source_ref,
+            "domain_scores": domain_scores,
+            "confidence_index": confidence_index,
+            "hard_triggers": hard_triggers or [],
+            "case_kind": "client_profile",
+            "evidence_links": [f"source_ref:{source_ref}", f"client:{int(client_id)}"],
+        }
+        if callable(autoscore_ingest_self_check):
+            ok, _normalized, _error, _policy = autoscore_ingest_self_check(
+                payload=payload,
+                actor_id=int(user_id),
+                actor_role="CONTROLLER",
+                route="/modules/clients/autoscore-preflight",
+                request_id=None,
+            )
+            if not ok:
+                return
+        emit_module_autoscore_input(
+            client_id=int(client_id),
+            module_id=str(payload["module_id"]),
+            source_ref=str(payload["source_ref"]),
+            domain_scores=dict(payload["domain_scores"]),
+            confidence_index=float(payload["confidence_index"]),
+            hard_triggers=list(payload["hard_triggers"]),
+            actor_id=int(user_id),
+            actor_role="CONTROLLER",
+            case_kind=str(payload["case_kind"]),
+            evidence_links=list(payload["evidence_links"]),
+        )
+
+    def _scores_from_client_payload(payload: dict) -> tuple[dict[str, float], float]:
+        risk_level = str(payload.get("risk_level") or "low").strip().lower()
+        status = str(payload.get("status") or "active").strip().lower()
+        risk_map = {"low": 10.0, "moderate": 35.0, "medium": 35.0, "high": 70.0, "critical": 90.0}
+        base = risk_map.get(risk_level, 18.0)
+        status_bump = 0.0 if status in {"active", "approved"} else 12.0
+        scores = {
+            "IRI": min(100.0, 12.0 + status_bump),
+            "OCE": min(100.0, 14.0 + base * 0.45),
+            "RNE": min(100.0, 12.0 + base * 0.35),
+            "SPA": min(100.0, 14.0 + base * 0.55),
+            "FBT": min(100.0, 10.0 + base * 0.25),
+            "TPD": min(100.0, 8.0 + base * 0.20),
+            "JSE": min(100.0, 10.0 + base * 0.20),
+            "GAI": min(100.0, 12.0 + base * 0.30),
+            "BCR": min(100.0, 12.0 + base * 0.35),
+            "DDI": min(100.0, 12.0 + status_bump),
+        }
+        confidence = 72.0 if status in {"active", "approved"} else 64.0
+        return scores, confidence
 
     def clients_page(request):
         user = require_any_permission(request, ["client.view", "client.manage"])
@@ -252,6 +324,14 @@ def build_clients_handlers(deps: dict) -> dict:
                 "INSERT OR IGNORE INTO client_assistants (client_id, assistant_id) VALUES (?, ?)",
                 (client_id, assistant_id),
             )
+        scores, confidence = _scores_from_client_payload(payload)
+        _emit_clients_autoscore(
+            client_id=int(client_id),
+            user_id=int(user["id"]),
+            source_ref=f"client_create:{client_id}",
+            domain_scores=scores,
+            confidence_index=confidence,
+        )
         log_audit(user["id"], "client.create", f"id={client_id} name={payload.get('display_name')}")
         return RedirectResponse(f"/clients/{client_id}?msg=Client%20created", status_code=303)
 
@@ -366,7 +446,7 @@ def build_clients_handlers(deps: dict) -> dict:
         kyc_cases = []
         risk_cases = []
         try:
-            kyc_cases = fetch_all(
+            kyc_case_rows = fetch_all(
                 """
                 SELECT c.id as case_id, c.status as case_status, c.created_at, c.updated_at,
                        a.applicant_id, a.external_user_id, a.display_name, a.email, a.review_date,
@@ -379,6 +459,8 @@ def build_clients_handlers(deps: dict) -> dict:
                 """,
                 (client_id,),
             )
+            kyc_cases = [dict(row) for row in kyc_case_rows]
+            annotate_rows_with_certification(rows=kyc_cases, fetch_all=fetch_all, case_kind="kyc", id_field="case_id")
         except Exception as exc:
             error = error or f"Unable to load applicants: {exc}"
         try:
@@ -415,10 +497,22 @@ def build_clients_handlers(deps: dict) -> dict:
                 (client_id,),
             )
             linked_risk_cases = [dict(row) for row in linked_risk_cases]
+            annotate_rows_with_certification(
+                rows=linked_risk_cases,
+                fetch_all=fetch_all,
+                case_kind="risk_case",
+                id_field="case_id",
+            )
             for row in linked_risk_cases:
                 row["protocol_number"] = risk_case_protocol(row.get("case_id"), str(row.get("created_at") or ""))
                 row["case_url"] = f"/risk/cases/{row.get('case_id')}"
             linked_invoice_cases = [dict(row) for row in linked_invoice_cases]
+            annotate_rows_with_certification(
+                rows=linked_invoice_cases,
+                fetch_all=fetch_all,
+                case_kind="risk_invoice",
+                id_field="case_id",
+            )
             for row in linked_invoice_cases:
                 row["case_url"] = f"/risk/invoices/{row.get('case_id')}/overview"
             risk_cases = linked_risk_cases + linked_invoice_cases
@@ -481,6 +575,14 @@ def build_clients_handlers(deps: dict) -> dict:
                 "INSERT OR IGNORE INTO client_assistants (client_id, assistant_id) VALUES (?, ?)",
                 (client_id, assistant_id),
             )
+        scores, confidence = _scores_from_client_payload(payload)
+        _emit_clients_autoscore(
+            client_id=int(client_id),
+            user_id=int(user["id"]),
+            source_ref=f"client_update:{client_id}",
+            domain_scores=scores,
+            confidence_index=confidence,
+        )
         log_audit(user["id"], "client.update", f"id={client_id}")
         return RedirectResponse(f"/clients/{client_id}?msg=Client%20saved", status_code=303)
 
@@ -547,7 +649,7 @@ def build_clients_handlers(deps: dict) -> dict:
         kyc_cases = []
         risk_cases = []
         try:
-            kyc_cases = fetch_all(
+            kyc_case_rows = fetch_all(
                 """
                 SELECT c.id as case_id, c.status as case_status, c.created_at, c.updated_at,
                        a.applicant_id, a.external_user_id, a.display_name, a.email, a.review_date, a.raw_json,
@@ -560,6 +662,8 @@ def build_clients_handlers(deps: dict) -> dict:
                 """,
                 (client_id,),
             )
+            kyc_cases = [dict(row) for row in kyc_case_rows]
+            annotate_rows_with_certification(rows=kyc_cases, fetch_all=fetch_all, case_kind="kyc", id_field="case_id")
         except Exception as exc:
             error = error or f"Unable to load applicants: {exc}"
         try:
@@ -596,10 +700,22 @@ def build_clients_handlers(deps: dict) -> dict:
                 (client_id,),
             )
             linked_risk_cases = [dict(row) for row in linked_risk_cases]
+            annotate_rows_with_certification(
+                rows=linked_risk_cases,
+                fetch_all=fetch_all,
+                case_kind="risk_case",
+                id_field="case_id",
+            )
             for row in linked_risk_cases:
                 row["protocol_number"] = risk_case_protocol(row.get("case_id"), str(row.get("created_at") or ""))
                 row["case_url"] = f"/risk/cases/{row.get('case_id')}"
             linked_invoice_cases = [dict(row) for row in linked_invoice_cases]
+            annotate_rows_with_certification(
+                rows=linked_invoice_cases,
+                fetch_all=fetch_all,
+                case_kind="risk_invoice",
+                id_field="case_id",
+            )
             for row in linked_invoice_cases:
                 row["case_url"] = f"/risk/invoices/{row.get('case_id')}/overview"
             risk_cases = linked_risk_cases + linked_invoice_cases
@@ -664,6 +780,36 @@ def build_clients_handlers(deps: dict) -> dict:
             case_type = (link.get("case_type") or "").strip().lower()
             if case_id and case_type:
                 link["case_url"] = f"/kyc/case/{case_id}?segment={case_type}"
+        autoscore_runs: list[dict] = []
+        try:
+            run_rows = fetch_all(
+                """
+                SELECT id, computed_at, computed_by_role, r_final, risk_class, decision_state, status,
+                       final_decision_state, final_risk_class, finalized_at,
+                       override_applied_at, override_reason_signature, payload_json
+                FROM client_score_runs
+                WHERE client_id = ?
+                ORDER BY computed_at DESC, id DESC
+                LIMIT 12
+                """,
+                (client_id,),
+            )
+            autoscore_runs = []
+            for row in run_rows:
+                item = dict(row)
+                payload = {}
+                try:
+                    payload = json.loads(item.get("payload_json") or "{}")
+                except Exception:
+                    payload = {}
+                aggregate = payload.get("aggregate") or {}
+                item["source_count"] = len(list(aggregate.get("source_rows") or []))
+                item["hard_trigger_categories"] = list(aggregate.get("hard_trigger_categories") or [])
+                autoscore_runs.append(item)
+        except Exception as exc:
+            error = error or f"Unable to load autoscore runs: {exc}"
+        can_create_autoscore = bool(has_permission(user, "risk.create") or has_permission(user, "kyc.manage") or user.get("is_admin"))
+        can_finalize_autoscore = bool(has_permission(user, "risk.close") or has_permission(user, "audit.view") or user.get("is_admin"))
         return templates.TemplateResponse(
             "client_overview.html",
             {
@@ -686,6 +832,108 @@ def build_clients_handlers(deps: dict) -> dict:
                     "name": client_display_name(client) or f"Client {client_id}",
                 },
                 "relationship_links": relationship_links,
+                "autoscore_runs": autoscore_runs,
+                "can_create_autoscore": can_create_autoscore,
+                "can_finalize_autoscore": can_finalize_autoscore,
+            },
+        )
+
+    def client_autoscore_run_detail(request, client_id: int, run_id: int):
+        user = require_any_permission(request, ["client.view", "settings.audit", "risk.view"])
+        if not client_crypto_ready():
+            return RedirectResponse("/clients?msg=Client%20encryption%20not%20configured", status_code=303)
+        client = get_client(client_id)
+        if not client:
+            return HTMLResponse("<h3>Client not found.</h3>", status_code=404)
+        row = fetch_one(
+            """
+            SELECT *
+            FROM client_score_runs
+            WHERE id = ? AND client_id = ?
+            """,
+            (int(run_id), int(client_id)),
+        )
+        if not row:
+            return HTMLResponse("<h3>Autoscore run not found.</h3>", status_code=404)
+        run = dict(row)
+        for key in ("payload_json", "source_input_ids_json", "override_weights_json", "override_result_json"):
+            raw = run.get(key)
+            parsed_key = key.replace("_json", "")
+            try:
+                run[parsed_key] = json.loads(raw) if raw else None
+            except Exception:
+                run[parsed_key] = None
+        payload = run.get("payload") or {}
+        aggregate = payload.get("aggregate") or {}
+        lineage = list(payload.get("lineage") or aggregate.get("source_rows") or [])
+        for item in lineage:
+            case_id = item.get("case_id")
+            case_kind = str(item.get("case_kind") or "").strip().lower()
+            if case_id and case_kind == "kyc":
+                item["case_url"] = f"/kyc/case/{case_id}"
+            elif case_id and case_kind == "risk_case":
+                item["case_url"] = f"/risk/cases/{case_id}"
+            elif case_id and case_kind == "risk_invoice":
+                item["case_url"] = f"/risk/invoices/{case_id}/overview"
+            elif str(item.get("module_id") or "") == "clients":
+                item["case_url"] = f"/clients/{client_id}"
+        override_weights = run.get("override_weights") or {}
+        override_result = run.get("override_result") or {}
+        weight_diff = []
+        policy_weights = payload.get("policy_domain_weights") or {}
+        if not policy_weights:
+            policy_weights = (payload.get("policy") or {}).get("domain_weights") or {}
+        if not policy_weights:
+            policy_weights = (aggregate.get("domain_weights") or {})
+        for code in ("IRI", "OCE", "RNE", "SPA", "FBT", "TPD", "JSE", "GAI", "BCR", "DDI"):
+            base = float(policy_weights.get(code, 0.0)) if isinstance(policy_weights, dict) else 0.0
+            over = float(override_weights.get(code, base)) if isinstance(override_weights, dict) else base
+            weight_diff.append({"code": code, "base": round(base, 4), "override": round(over, 4), "delta": round(over - base, 4)})
+        audit_events = []
+        try:
+            run_events = fetch_all(
+                """
+                SELECT created_at, actor_role, action, details_json
+                FROM core_audit_events
+                WHERE object_type = 'client_score_run' AND object_id = ?
+                ORDER BY created_at DESC
+                LIMIT 50
+                """,
+                (str(run_id),),
+            )
+            audit_events = [dict(r) for r in run_events]
+            source_input_ids = run.get("source_input_ids") or []
+            if source_input_ids:
+                placeholders = ",".join("?" for _ in source_input_ids)
+                params = tuple(str(int(i)) for i in source_input_ids if str(i).lstrip("-").isdigit())
+                if params:
+                    input_events = fetch_all(
+                        f"""
+                        SELECT created_at, actor_role, action, details_json
+                        FROM core_audit_events
+                        WHERE object_type = 'client_score_input' AND object_id IN ({placeholders})
+                        ORDER BY created_at DESC
+                        LIMIT 100
+                        """,
+                        params,
+                    )
+                    audit_events.extend(dict(r) for r in input_events)
+            audit_events.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        except Exception:
+            audit_events = []
+        return templates.TemplateResponse(
+            "client_autoscore_run_detail.html",
+            {
+                "request": request,
+                "app_name": APP_NAME,
+                "user": user,
+                "client": client,
+                "run": run,
+                "aggregate": aggregate,
+                "lineage": lineage,
+                "weight_diff": weight_diff,
+                "override_result": override_result,
+                "audit_events": audit_events,
             },
         )
 
@@ -802,6 +1050,24 @@ def build_clients_handlers(deps: dict) -> dict:
         payload["kvk_last_update_at"] = now
         enc = encrypt_client_payload(payload)
         execute("UPDATE clients SET updated_at = ?, data_enc = ? WHERE id = ?", (now, enc, client_id))
+        _emit_clients_autoscore(
+            client_id=int(client_id),
+            user_id=int(user["id"]),
+            source_ref=f"client_kvk_refresh:{client_id}",
+            domain_scores={
+                "IRI": 10.0,
+                "OCE": 12.0,
+                "RNE": 10.0,
+                "SPA": 10.0,
+                "FBT": 8.0,
+                "TPD": 8.0,
+                "JSE": 10.0,
+                "GAI": 10.0,
+                "BCR": 10.0,
+                "DDI": 12.0,
+            },
+            confidence_index=84.0,
+        )
         log_audit(user["id"], "client.kvk.refresh", f"id={client_id}")
         return JSONResponse({"ok": True, "fields": fields})
 
@@ -1333,6 +1599,25 @@ def build_clients_handlers(deps: dict) -> dict:
                 json.dumps(data),
             ),
         )
+        if report_type == "risk":
+            _emit_clients_autoscore(
+                client_id=int(client_id),
+                user_id=int(user["id"]),
+                source_ref=f"client_risk_report:{report_id}",
+                domain_scores={
+                    "IRI": 14.0,
+                    "OCE": 22.0,
+                    "RNE": 26.0,
+                    "SPA": 24.0,
+                    "FBT": 20.0,
+                    "TPD": 16.0,
+                    "JSE": 16.0,
+                    "GAI": 22.0,
+                    "BCR": 24.0,
+                    "DDI": 20.0,
+                },
+                confidence_index=76.0,
+            )
         return RedirectResponse(
             f"/clients/{client_id}/reports/new?msg=Report%20saved&download={report_id}",
             status_code=303,
@@ -1348,6 +1633,7 @@ def build_clients_handlers(deps: dict) -> dict:
         "client_edit": client_edit,
         "client_update": client_update,
         "client_detail": client_detail,
+        "client_autoscore_run_detail": client_autoscore_run_detail,
         "client_kyc_invite_create": client_kyc_invite_create,
         "client_kvk_refresh": client_kvk_refresh,
         "client_delete": client_delete,

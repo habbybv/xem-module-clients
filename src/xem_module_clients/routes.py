@@ -9,6 +9,7 @@ def create_router(deps: dict) -> APIRouter:
     clients_create_handler = deps["clients_create_handler"]
     clients_lookup_handler = deps["clients_lookup_handler"]
     client_detail_handler = deps["client_detail_handler"]
+    client_autoscore_run_detail_handler = deps["client_autoscore_run_detail_handler"]
     client_kyc_invite_create_handler = deps["client_kyc_invite_create_handler"]
     client_edit_handler = deps["client_edit_handler"]
     client_update_handler = deps["client_update_handler"]
@@ -53,6 +54,10 @@ def create_router(deps: dict) -> APIRouter:
     @router.get("/clients/{client_id}", response_class=HTMLResponse)
     def client_detail(request: Request, client_id: int):
         return client_detail_handler(request, client_id)
+
+    @router.get("/clients/{client_id}/autoscore-runs/{run_id}", response_class=HTMLResponse)
+    def client_autoscore_run_detail(request: Request, client_id: int, run_id: int):
+        return client_autoscore_run_detail_handler(request, client_id, run_id)
 
     @router.post("/clients/{client_id}/kyc-invite-create", response_class=JSONResponse)
     async def client_kyc_invite_create(request: Request, client_id: int):
