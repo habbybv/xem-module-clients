@@ -7,7 +7,7 @@ def get_manifest() -> dict[str, Any]:
     return {
         "id": "clients",
         "name": "Clients",
-        "version": "0.1.2",
+        "version": "0.1.3",
         "description": "Client registry, profiles, and report workflows",
         "category": "operations",
         "enabled_by_default": True,
